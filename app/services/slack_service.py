@@ -1,7 +1,9 @@
 import json
 import hmac
 import hashlib
-import requests
+from typing import Awaitable, Callable, Optional
+
+from slack_sdk.web.async_client import AsyncWebClient
 from app.config import settings
 
 def verify_slack_signature(request_body: bytes, timestamp: str, signature: str) -> bool:
@@ -18,32 +20,51 @@ def verify_slack_signature(request_body: bytes, timestamp: str, signature: str) 
     
     return hmac.compare_digest(expected_signature, signature)
 
-async def send_slack_message(channel: str, text: str, thread_ts: str = None):
-    """Enviar mensaje usando Slack Web API"""
+async def send_slack_message(channel: str, text: str, thread_ts: Optional[str] = None) -> bool:
+    """Enviar mensaje usando Slack Web API (async, no bloqueante)."""
     if not settings.slack_bot_token:
         return False
-    
-    url = "https://slack.com/api/chat.postMessage"
-    headers = {
-        "Authorization": f"Bearer {settings.slack_bot_token}",
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        "channel": channel,
-        "text": text
-    }
-    
-    # Si hay thread, responder en el thread
-    if thread_ts:
-        payload["thread_ts"] = thread_ts
-    
+
+    client = AsyncWebClient(token=settings.slack_bot_token)
     try:
-        response = requests.post(url, headers=headers, json=payload)
-        result = response.json()
-        return result.get('ok', False)
+        kwargs = {"channel": channel, "text": text}
+        if thread_ts:
+            kwargs["thread_ts"] = thread_ts
+        resp = await client.chat_postMessage(**kwargs)
+        return bool(resp.get("ok", False))
     except Exception:
         return False
+
+# ------------------
+# Command routing
+# ------------------
+CommandHandler = Callable[[str, str], Awaitable[str]]
+
+async def handle_hello(user: str, channel: str) -> str:
+    return f"¡Hola <@{user}>! Soy Wasi Assistant 🏠\n¿En qué puedo ayudarte hoy?"
+
+async def handle_help(user: str, channel: str) -> str:
+    return (
+        "🤖 *Wasi Assistant - Comandos disponibles:*\n\n"
+        "• `hello` - Saludo\n"
+        "• `help` - Mostrar esta ayuda\n"
+        "• `status` - Estado del sistema\n\n"
+        "_Próximamente: crear reuniones, buscar contactos y más!_"
+    )
+
+async def handle_status(user: str, channel: str) -> str:
+    return (
+        "✅ *Estado del sistema:*\n"
+        "• Slack: Conectado\n"
+        f"• Usuario: <@{user}>\n"
+        f"• Canal: <#{channel}>"
+    )
+
+async def handle_default(user: str, channel: str, text: str) -> str:
+    return (
+        f"Recibí tu mensaje: _{text}_\n\n"
+        "Escribe `help` para ver qué puedo hacer 🤖"
+    )
 
 async def process_slack_message(event_data: dict) -> dict:
     """Procesar mensaje de Slack"""
@@ -59,36 +80,23 @@ async def process_slack_message(event_data: dict) -> dict:
     channel = event.get('channel', '')
     thread_ts = event.get('thread_ts')
     
-    # Generar respuesta según el comando
-    response_text = ""
-    
-    if 'hello' in text or 'hola' in text:
-        response_text = f"¡Hola <@{user}>! Soy Wasi Assistant 🏠\n¿En qué puedo ayudarte hoy?"
-        
-    elif 'help' in text or 'ayuda' in text:
-        response_text = (
-            f"🤖 *Wasi Assistant - Comandos disponibles:*\n\n"
-            f"• `hello` - Saludo\n"
-            f"• `help` - Mostrar esta ayuda\n"
-            f"• `status` - Estado del sistema\n\n"
-            f"_Próximamente: crear reuniones, buscar contactos y más!_"
-        )
-        
-    elif 'status' in text or 'estado' in text:
-        response_text = (
-            f"✅ *Estado del sistema:*\n"
-            f"• Slack: Conectado\n"
-            f"• Servidor: Funcionando\n"
-            f"• Usuario: <@{user}>\n"
-            f"• Canal: <#{channel}>"
-        )
-        
-    else:
-        # Respuesta por defecto
-        response_text = (
-            f"Recibí tu mensaje: _{text}_\n\n"
-            f"Escribe `help` para ver qué puedo hacer 🤖"
-        )
+    # Enrutamiento simple de comandos
+    handlers: list[tuple[list[str], CommandHandler]] = [
+        (["hello", "hola"], handle_hello),
+        (["help", "ayuda"], handle_help),
+        (["status", "estado"], handle_status),
+    ]
+
+    response_text: str
+    matched = False
+    for keywords, handler in handlers:
+        if any(k in text for k in keywords):
+            response_text = await handler(user, channel)
+            matched = True
+            break
+
+    if not matched:
+        response_text = await handle_default(user, channel, text)
     
     # Enviar respuesta
     await send_slack_message(channel, response_text, thread_ts)
